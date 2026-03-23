@@ -1,0 +1,8 @@
+# Scanner de vulnerabilidades web + E2E
+# Python 3.9+
+
+flask>=2.0
+
+# Opcional: E2E avançado (Turnstile, profile, Bézier)
+# playwright>=1.40.0
+# Depois: python -m playwright install chromium
