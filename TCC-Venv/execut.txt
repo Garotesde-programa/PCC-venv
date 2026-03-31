@@ -1,0 +1,2 @@
+cd d:\venv\Scripts
+python app_web.py

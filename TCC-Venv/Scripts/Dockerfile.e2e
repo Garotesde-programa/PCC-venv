@@ -1,0 +1,48 @@
+# E2E Playwright em Debian 12 com xvfb (infra proprietária, Cloudflare Turnstile)
+FROM debian:12-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    xvfb \
+    libnss3 \
+    libnspr4 \
+    libatk1.0-0 \
+    libatk-bridge2.0-0 \
+    libcups2 \
+    libdrm2 \
+    libdbus-1-3 \
+    libxkbcommon0 \
+    libatspi2.0-0 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxfixes3 \
+    libxrandr2 \
+    libgbm1 \
+    libasound2 \
+    libpango-1.0-0 \
+    libcairo2 \
+    fonts-liberation \
+    python3 \
+    python3-pip \
+    python3-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements-e2e.txt /app/
+RUN pip install --no-cache-dir -r requirements-e2e.txt && \
+    python3 -m playwright install chromium && \
+    python3 -m playwright install-deps chromium || true
+
+COPY e2e_playwright.py entrypoint-e2e.sh /app/
+RUN chmod +x /app/entrypoint-e2e.sh
+
+# xvfb usa display :99 (definido no entrypoint)
+ENV DISPLAY=:99
+
+ENTRYPOINT ["/app/entrypoint-e2e.sh"]
+CMD ["https://example.com"]

@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Scanner de Vulnerabilidades</title>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Space+Grotesk:wght@400;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Scanner de Vulnerabilidades</h1>
+            <p class="subtitle">Misconfig • SQLi • XSS • Open Redirect • LFI • Cookies • HTTPS • Info Disclosure</p>
+        </header>
+
+        <div class="card">
+            <form id="scanForm">
+                <div class="form-group">
+                    <label for="url">URL do site</label>
+                    <input type="url" id="url" name="url" placeholder="https://exemplo.com" required>
+                </div>
+                <div class="form-group">
+                    <label>Verificações</label>
+                    <div class="checks">
+                        <div class="check-item">
+                            <input type="checkbox" id="misconfig" name="checks" value="misconfig" checked>
+                            <label for="misconfig">Misconfiguration</label>
+                        </div>
+                        <div class="check-item">
+                            <input type="checkbox" id="sql" name="checks" value="sql" checked>
+                            <label for="sql">SQL Injection</label>
+                        </div>
+                        <div class="check-item">
+                            <input type="checkbox" id="xss" name="checks" value="xss" checked>
+                            <label for="xss">XSS</label>
+                        </div>
+                        <div class="check-item">
+                            <input type="checkbox" id="redirect" name="checks" value="redirect" checked>
+                            <label for="redirect">Open Redirect</label>
+                        </div>
+                        <div class="check-item">
+                            <input type="checkbox" id="http_methods" name="checks" value="http_methods">
+                            <label for="http_methods">HTTP Methods</label>
+                        </div>
+                        <div class="check-item">
+                            <input type="checkbox" id="cors" name="checks" value="cors">
+                            <label for="cors">CORS</label>
+                        </div>
+                        <div class="check-item">
+                            <input type="checkbox" id="info" name="checks" value="info">
+                            <label for="info">Info Disclosure</label>
+                        </div>
+                        <div class="check-item">
+                            <input type="checkbox" id="lfi" name="checks" value="lfi">
+                            <label for="lfi">LFI / Path Traversal</label>
+                        </div>
+                        <div class="check-item">
+                            <input type="checkbox" id="cookie" name="checks" value="cookie">
+                            <label for="cookie">Cookie Security</label>
+                        </div>
+                        <div class="check-item">
+                            <input type="checkbox" id="https" name="checks" value="https">
+                            <label for="https">HTTPS Redirect</label>
+                        </div>
+                    </div>
+                </div>
+                <div class="form-group preset-btns">
+                    <label>Presets</label>
+                    <div class="presets">
+                        <button type="button" class="preset-btn" data-preset="fast">Rápido</button>
+                        <button type="button" class="preset-btn" data-preset="full">Completo</button>
+                        <button type="button" class="preset-btn" data-preset="headers">Só headers</button>
+                        <button type="button" class="preset-btn" data-preset="injection">Injeção (SQL+XSS)</button>
+                    </div>
+                </div>
+                <div class="form-group e2e-row">
+                    <div class="e2e-toggle">
+                        <input type="checkbox" id="e2e_human" name="e2e_human">
+                        <label for="e2e_human">Rodar E2E humanizado (Playwright)</label>
+                    </div>
+                    <p class="e2e-hint">Abre um navegador real na sua máquina e simula um usuário navegando nessa URL.</p>
+                </div>
+                {% if e2e_advanced_available %}
+                <div class="form-group e2e-advanced-row">
+                    <div class="e2e-toggle">
+                        <input type="checkbox" id="e2e_advanced" name="e2e_advanced">
+                        <label for="e2e_advanced">E2E avançado (Turnstile, profile, Bézier)</label>
+                    </div>
+                    <p class="e2e-hint">Cloudflare Turnstile, profile “quentado”, mouse Bézier, captura de token. Roda em background (headless).</p>
+                    <div class="e2e-advanced-opts">
+                        <div class="e2e-opt">
+                            <label for="e2e_profile">Profile (opcional)</label>
+                            <input type="text" id="e2e_profile" name="e2e_profile" placeholder="C:\caminho\para\profile">
+                        </div>
+                        <div class="e2e-opt">
+                            <label for="cloudflare_timeout">Timeout Cloudflare (ms)</label>
+                            <input type="number" id="cloudflare_timeout" name="cloudflare_timeout" value="60000" min="5000" max="300000" step="1000">
+                        </div>
+                    </div>
+                </div>
+                <div id="e2eStatus" class="e2e-status" style="display:none">
+                    <span class="e2e-status-label">E2E avançado:</span>
+                    <span id="e2eStatusText"></span>
+                    <pre id="e2eToken" class="e2e-token" style="display:none"></pre>
+                </div>
+                {% endif %}
+                <div id="formError" class="form-error" style="display:none"></div>
+                <button type="submit" class="btn" id="btnScan">Escanear</button>
+                <div id="scanProgressWrap" class="scan-progress-wrap" style="display:none">
+                    <div class="scan-progress-bar"><div id="scanProgressFill" class="scan-progress-fill"></div></div>
+                    <div id="scanProgressText" class="scan-progress-text">Iniciando...</div>
+                </div>
+            </form>
+        </div>
+
+        <div id="results" class="card">
+            <div class="results-header">
+                <span class="results-url" id="resultsUrl"></span>
+                <span id="resultsTotal"></span>
+            </div>
+            <div class="results-header-actions">
+                <button type="button" class="btn-export" id="btnExecutiveMode">Modo diretoria</button>
+                <button type="button" class="btn-export" id="btnHistory">Histórico</button>
+            </div>
+            <div id="directorMode" class="director-mode" style="display:none">
+                <div class="director-title">Resumo para diretoria</div>
+                <div id="directorSummary" class="director-summary"></div>
+            </div>
+            <div id="execSummary" class="exec-summary" style="display:none">
+                <div class="exec-kpi">
+                    <span class="exec-kpi-label">Risco</span>
+                    <span id="execRiskLabel" class="exec-kpi-value">-</span>
+                </div>
+                <div class="exec-kpi">
+                    <span class="exec-kpi-label">Score</span>
+                    <span id="execRiskScore" class="exec-kpi-value">-</span>
+                </div>
+                <div class="exec-kpi">
+                    <span class="exec-kpi-label">Confiança da análise</span>
+                    <span id="execConfidence" class="exec-kpi-value">-</span>
+                </div>
+            </div>
+            <div id="riskBarWrap" class="risk-bar-wrap" style="display:none">
+                <div class="risk-bar">
+                    <div id="riskBarFill" class="risk-bar-fill"></div>
+                </div>
+            </div>
+            <div id="trendBox" class="trend-box" style="display:none"></div>
+            <div id="aiInsights" class="ai-insights" style="display:none">
+                <div class="ai-title">IA do Scanner</div>
+                <div id="aiHeadline" class="ai-headline"></div>
+                <div id="aiSummary" class="ai-summary"></div>
+                <ul id="aiActions" class="ai-actions"></ul>
+                <div class="ai-plan-row">
+                    <button type="button" class="btn-export" id="btnGeneratePlan">Gerar plano de correção (7 dias)</button>
+                    <button type="button" class="btn-export" id="btnCopyPlan" style="display:none">Copiar plano</button>
+                </div>
+                <pre id="aiPlanOutput" class="ai-plan-output" style="display:none"></pre>
+            </div>
+            <div class="results-toolbar" id="resultsToolbar" style="display:none">
+                <label for="filterSeverity">Filtrar:</label>
+                <select id="filterSeverity" aria-label="Filtrar por severidade">
+                    <option value="">Todas</option>
+                    <option value="critical">Critical</option>
+                    <option value="high">High</option>
+                    <option value="medium">Medium</option>
+                    <option value="low">Low</option>
+                </select>
+                <select id="sortBy" aria-label="Ordenar">
+                    <option value="severity">Por severidade</option>
+                    <option value="type">Por tipo</option>
+                </select>
+            </div>
+            <div id="resultsList"></div>
+            <div id="historyPanel" class="history-panel" style="display:none"></div>
+            <div class="results-actions" id="resultsActions" style="display:none">
+                <button type="button" class="btn-export" id="btnExportJson">JSON</button>
+                <button type="button" class="btn-export" id="btnExportCsv">CSV</button>
+                <button type="button" class="btn-export" id="btnExportHtml">HTML</button>
+                <button type="button" class="btn-export" id="btnCopy">Copiar</button>
+            </div>
+        </div>
+        <button type="button" class="theme-toggle" id="themeToggle" aria-label="Alternar tema claro/escuro" title="Tema">🌓</button>
+        <button type="button" class="ambient-toggle" id="ambientToggle" aria-label="Música ambiente" title="Música ambiente">♫</button>
+    <div id="toast" class="toast" aria-live="polite"></div>
+    </div>
+    <script src="{{ url_for('static', filename='script.js') }}"></script>
+</body>
+</html>

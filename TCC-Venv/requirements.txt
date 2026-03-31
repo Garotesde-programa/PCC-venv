@@ -1,0 +1,13 @@
+# Scanner de vulnerabilidades web + E2E
+# Python 3.9+
+
+flask>=2.0
+
+# Opcional: E2E avançado (Turnstile, profile, Bézier)
+# playwright>=1.40.0
+# Depois: python -m playwright install chromium
+ faço a camada final de hardening: persistência de jobs/histórico em SQLite + cancelamento de scan em andamento + owner por ação no plano de 7 dias.
+faça isso. Além disso remova as seguintes partes: 
+Probabilidade:
+Pré-requisitos: 
+Delta: n/a
