@@ -15,16 +15,22 @@ import sys
 import os
 import time
 import random
+import hashlib
+import ipaddress
 from urllib.parse import urljoin, urlparse
 from concurrent.futures import ThreadPoolExecutor
+
+SCANNER_VERSION = '2.0.0'
 
 # Configuração (ajustáveis por variáveis de ambiente)
 TIMEOUT = int(os.getenv('SCANNER_TIMEOUT', '5'))
 MAX_WORKERS = int(os.getenv('SCANNER_MAX_WORKERS', '12'))
 SCAN_USER_AGENT = os.getenv(
     'SCANNER_USER_AGENT',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Scanner/1.0',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Scanner/2.0',
 )
+ALLOW_PRIVATE_TARGETS = os.getenv('SCANNER_ALLOW_PRIVATE', '').lower() in ('1', 'true', 'yes')
+ALLOW_LOCALHOST_TARGETS = os.getenv('SCANNER_ALLOW_LOCALHOST', '1').lower() in ('1', 'true', 'yes')
 
 SSL_CONTEXT = ssl.create_default_context()
 SSL_CONTEXT.check_hostname = False
@@ -38,6 +44,135 @@ class Colors:
     BLUE = '\033[94m'
     RESET = '\033[0m'
     BOLD = '\033[1m'
+
+
+CWE_BY_CHECK = {
+    'sql': 'CWE-89',
+    'xss': 'CWE-79',
+    'lfi': 'CWE-22',
+    'redirect': 'CWE-601',
+    'http_methods': 'CWE-650',
+    'cors': 'CWE-942',
+    'misconfig': 'CWE-16',
+    'info': 'CWE-200',
+    'cookie': 'CWE-614',
+    'https': 'CWE-319',
+}
+
+DEFAULT_CONFIDENCE = {
+    'sql': 'medium',
+    'xss': 'medium',
+    'lfi': 'medium',
+    'redirect': 'high',
+    'http_methods': 'high',
+    'cors': 'high',
+    'misconfig': 'high',
+    'info': 'high',
+    'cookie': 'high',
+    'https': 'high',
+}
+
+SEVERITY = {
+    'sql': 'critical', 'xss': 'critical', 'lfi': 'critical',
+    'http_methods': 'high', 'redirect': 'medium', 'cors': 'medium',
+    'misconfig': 'medium', 'info': 'low', 'cookie': 'medium',
+    'https': 'high',
+}
+
+REMEDIATION = {
+    'sql': 'Use prepared statements (parameterized queries). Nunca concatene input em SQL.',
+    'xss': 'Escape output (HTML entities), use CSP, valide e sanitize todo input.',
+    'misconfig': 'Configure headers de segurança no servidor (X-Frame-Options, CSP, etc). Adicione security.txt em /.well-known/security.txt.',
+    'redirect': 'Valide URLs de redirect contra whitelist. Não redirecione para URLs externas.',
+    'http_methods': 'Desabilite métodos perigosos (PUT, DELETE, TRACE) se não forem necessários.',
+    'info': 'Remova ou ofusque headers Server, X-Powered-By no servidor.',
+    'lfi': 'Evite incluir arquivos baseado em input. Use whitelist de arquivos permitidos.',
+    'cookie': 'Configure Set-Cookie com HttpOnly e Secure para cookies de sessão.',
+    'https': 'Configure redirect 301/302 de HTTP para HTTPS no servidor.',
+    'cors': 'Use Access-Control-Allow-Origin com origens específicas, nunca * com credenciais.',
+}
+
+
+def _finding_fingerprint(check_key: str, desc: str) -> str:
+    raw = f'{check_key}|{desc}'.encode('utf-8', errors='ignore')
+    return hashlib.sha256(raw).hexdigest()[:16]
+
+
+def make_finding(
+    check_key: str,
+    category_label: str,
+    desc: str,
+    *,
+    severity: str | None = None,
+    remediation: str | None = None,
+    confidence: str | None = None,
+    evidence: dict | None = None,
+    target_url: str | None = None,
+) -> dict:
+    sev = severity or SEVERITY.get(check_key, 'medium')
+    rem = remediation if remediation is not None else REMEDIATION.get(check_key, 'Consulte documentação de segurança.')
+    ev = dict(evidence or {})
+    if target_url and 'request_example' not in ev:
+        ev['request_example'] = f'GET {target_url}'
+    if desc and 'response_signal' not in ev:
+        ev['response_signal'] = desc[:220]
+    return {
+        'id': _finding_fingerprint(check_key, desc),
+        'type': category_label,
+        'check': check_key,
+        'desc': desc,
+        'severity': sev,
+        'remediation': rem,
+        'cwe': CWE_BY_CHECK.get(check_key, 'CWE-693'),
+        'confidence': confidence or DEFAULT_CONFIDENCE.get(check_key, 'medium'),
+        'evidence': ev,
+    }
+
+
+def _host_is_blocked(host: str) -> str | None:
+    host = (host or '').strip().lower().rstrip('.')
+    if not host:
+        return 'Host inválido na URL'
+    if host in ('localhost', '127.0.0.1', '::1'):
+        if not ALLOW_LOCALHOST_TARGETS:
+            return 'Varredura em localhost desabilitada (SCANNER_ALLOW_LOCALHOST=0)'
+        return None
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return None
+    if ip.is_loopback and not ALLOW_LOCALHOST_TARGETS:
+        return 'Alvo em loopback não permitido'
+    if ip.is_private or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+        if not ALLOW_PRIVATE_TARGETS:
+            return 'Alvo em rede privada/reservada bloqueado (use SCANNER_ALLOW_PRIVATE=1 com autorização)'
+    return None
+
+
+def validate_scan_target(url: str) -> tuple[str | None, str | None]:
+    """
+    Valida e normaliza URL de varredura.
+    Retorna (url_normalizada, mensagem_erro).
+    """
+    raw = (url or '').strip()
+    if not raw:
+        return None, 'URL é obrigatória'
+    if len(raw) > 2048:
+        return None, 'URL muito longa'
+    if not raw.startswith(('http://', 'https://')):
+        raw = 'https://' + raw
+    parsed = urlparse(raw)
+    if parsed.scheme not in ('http', 'https'):
+        return None, 'Apenas HTTP/HTTPS são suportados'
+    host = (parsed.netloc or '').split(':')[0]
+    blocked = _host_is_blocked(host)
+    if blocked:
+        return None, blocked
+    path = parsed.path or '/'
+    normalized = f'{parsed.scheme}://{parsed.netloc}{path}'
+    if parsed.query:
+        normalized += f'?{parsed.query}'
+    return normalized, None
 
 
 def make_request(url, data=None, method='GET', headers=None):
@@ -459,29 +594,6 @@ def check_security_txt(url):
     return findings
 
 
-# ============ SEVERIDADE E REMEDIAÇÃO ============
-
-SEVERITY = {
-    'sql': 'critical', 'xss': 'critical', 'lfi': 'critical',
-    'http_methods': 'high', 'redirect': 'medium', 'cors': 'medium',
-    'misconfig': 'medium', 'info': 'low', 'cookie': 'medium',
-    'https': 'high',
-}
-
-REMEDIATION = {
-    'sql': 'Use prepared statements (parameterized queries). Nunca concatene input em SQL.',
-    'xss': 'Escape output (HTML entities), use CSP, valide e sanitize todo input.',
-    'misconfig': 'Configure headers de segurança no servidor (X-Frame-Options, CSP, etc). Adicione security.txt em /.well-known/security.txt.',
-    'redirect': 'Valide URLs de redirect contra whitelist. Não redirecione para URLs externas.',
-    'http_methods': 'Desabilite métodos perigosos (PUT, DELETE, TRACE) se não forem necessários.',
-    'info': 'Remova ou ofusque headers Server, X-Powered-By no servidor.',
-    'lfi': 'Evite incluir arquivos baseado em input. Use whitelist de arquivos permitidos.',
-    'cookie': 'Configure Set-Cookie com HttpOnly e Secure para cookies de sessão.',
-    'https': 'Configure redirect 301/302 de HTTP para HTTPS no servidor.',
-    'cors': 'Use Access-Control-Allow-Origin com origens específicas, nunca * com credenciais.',
-}
-
-
 # ============ MAIN ============
 
 CHECK_FUNCS = {
@@ -503,32 +615,41 @@ CHECK_FUNCS = {
 }
 
 
-def scan(url, checks=None, progress_cb=None):
+def scan(url, checks=None, progress_cb=None, cancel_cb=None):
     if checks is None:
         checks = ['misconfig', 'sql', 'xss', 'redirect', 'http_methods', 'info']
 
-    all_findings = []
-    print(f"\n{Colors.BOLD}{Colors.BLUE}[*] Scan: {url}{Colors.RESET}\n")
+    started = time.time()
+    all_findings: list[dict] = []
+    seen_ids: set[str] = set()
+    print(f"\n{Colors.BOLD}{Colors.BLUE}[*] Scan v{SCANNER_VERSION}: {url}{Colors.RESET}\n")
 
     for check_name in checks:
+        if cancel_cb and cancel_cb():
+            break
         if check_name not in CHECK_FUNCS:
             continue
         for label, func in CHECK_FUNCS[check_name]:
+            if cancel_cb and cancel_cb():
+                break
             if progress_cb:
                 progress_cb(check_name, label, 'running')
             print(f"{Colors.YELLOW}[+] {label}...{Colors.RESET}", end=' ', flush=True)
             try:
                 results = func(url)
                 items = results if isinstance(results, list) else ([results] if results else [])
-                sev = SEVERITY.get(check_name, 'medium')
-                rem = REMEDIATION.get(check_name, 'Consulte documentação de segurança.')
+                category = check_name.upper().replace('_', ' ')
                 for r in items:
-                    all_findings.append((
-                        check_name.upper().replace('_', ' '),
-                        r,
-                        sev,
-                        rem,
-                    ))
+                    item = make_finding(
+                        check_name,
+                        category,
+                        str(r),
+                        target_url=url,
+                    )
+                    if item['id'] in seen_ids:
+                        continue
+                    seen_ids.add(item['id'])
+                    all_findings.append(item)
                 if progress_cb:
                     progress_cb(check_name, label, 'done')
                 print(f"{Colors.GREEN}OK{Colors.RESET}")
@@ -536,9 +657,29 @@ def scan(url, checks=None, progress_cb=None):
                 if progress_cb:
                     progress_cb(check_name, label, 'error')
                 print(f"{Colors.RED}Erro{Colors.RESET}")
-                all_findings.append((check_name.upper(), f"Erro: {e}", 'low', 'Verifique logs.'))
+                item = make_finding(
+                    check_name,
+                    check_name.upper(),
+                    f'Erro: {e}',
+                    severity='low',
+                    remediation='Verifique logs e conectividade com o alvo.',
+                    confidence='low',
+                )
+                if item['id'] not in seen_ids:
+                    seen_ids.add(item['id'])
+                    all_findings.append(item)
 
-    return all_findings
+    duration_ms = int((time.time() - started) * 1000)
+    return {
+        'findings': all_findings,
+        'meta': {
+            'scanner_version': SCANNER_VERSION,
+            'duration_ms': duration_ms,
+            'checks_run': list(checks),
+            'findings_count': len(all_findings),
+            'cancelled': bool(cancel_cb and cancel_cb()),
+        },
+    }
 
 
 def main():
@@ -554,11 +695,15 @@ def main():
         help='Executa um fluxo E2E com Playwright simulando comportamento humano (QA)',
     )
     args = parser.parse_args()
-    url = args.url
-    if not url.startswith(('http://', 'https://')):
-        url = 'https://' + url
+    url, err = validate_scan_target(args.url)
+    if err:
+        print(f"{Colors.RED}[ERRO] {err}{Colors.RESET}")
+        return 2
 
-    findings = scan(url, args.checks)
+    report = scan(url, args.checks)
+    findings = report['findings']
+    meta = report.get('meta', {})
+    print(f"{Colors.BLUE}[*] Concluído em {meta.get('duration_ms', 0)} ms{Colors.RESET}")
 
     if args.e2e_human:
         try:
@@ -574,10 +719,12 @@ def main():
         return 0
 
     for item in findings:
-        vuln_type = item[0]
-        desc = item[1]
-        c = Colors.RED if 'SQL' in vuln_type or 'XSS' in vuln_type or 'LFI' in vuln_type else Colors.YELLOW
-        print(f"{c}[{vuln_type}]{Colors.RESET} {desc}")
+        vuln_type = item.get('type', 'VULN')
+        desc = item.get('desc', '')
+        cwe = item.get('cwe', '')
+        c = Colors.RED if any(x in vuln_type for x in ('SQL', 'XSS', 'LFI')) else Colors.YELLOW
+        extra = f" ({cwe})" if cwe else ''
+        print(f"{c}[{vuln_type}]{extra}{Colors.RESET} {desc}")
     print(f"\n{Colors.YELLOW}Total: {len(findings)}{Colors.RESET}")
     return 1
 

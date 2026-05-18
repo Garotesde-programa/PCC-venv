@@ -30,7 +30,11 @@ const historyPanel = document.getElementById('historyPanel');
 const scanProgressWrap = document.getElementById('scanProgressWrap');
 const scanProgressFill = document.getElementById('scanProgressFill');
 const scanProgressText = document.getElementById('scanProgressText');
+const btnCancelScan = document.getElementById('btnCancelScan');
+const scanMeta = document.getElementById('scanMeta');
+const scanAuthorized = document.getElementById('scanAuthorized');
 let lastReport = null;
+let currentJobId = null;
 
 const STORAGE_URL = 'scanner_last_url';
 const STORAGE_CHECKS = 'scanner_last_checks';
@@ -258,6 +262,8 @@ function renderFindings(findings) {
                 <div class="result-title">
                     <span class="result-badge ${cls}">${escapeHtml(f.type)}</span>
                     <span class="result-badge ${sev}">${sev}</span>
+                    ${(f.cwe) ? `<span class="result-badge cwe">${escapeHtml(f.cwe)}</span>` : ''}
+                    ${(f.confidence) ? `<span class="result-badge conf">${escapeHtml(f.confidence)} conf.</span>` : ''}
                 </div>
             </div>
             <div class="result-body">
@@ -266,13 +272,11 @@ function renderFindings(findings) {
             </div>
             ${rem ? `<div class="remediation-tip" id="rem-${i}">${escapeHtml(rem)}</div>` : ''}
             <details class="attack-flow">
-                <summary>Como um atacante exploraria isso (visão empresa)</summary>
+                <summary>Impacto de negócio (visão executiva)</summary>
                 <div class="attack-content">
                     <div><strong>Exploração provável:</strong> ${escapeHtml(abuse.exploit)}</div>
                     <div><strong>Impacto para a empresa:</strong> ${escapeHtml(abuse.impact)}</div>
-                    <div><strong>Probabilidade:</strong> ${escapeHtml(abuse.likelihood)}</div>
-                    <div><strong>Pré-requisitos:</strong> ${escapeHtml(abuse.prereqs)}</div>
-                    ${evidence.response_signal ? `<div><strong>Evidência:</strong> ${escapeHtml(evidence.response_signal)}</div>` : ''}
+                    ${evidence.response_signal ? `<div><strong>Evidência técnica:</strong> ${escapeHtml(evidence.response_signal)}</div>` : ''}
                 </div>
             </details>
         </div>`;
@@ -383,9 +387,22 @@ function getAbuseNarrative(finding) {
     return {
         exploit: 'Combinar esse achado com outras falhas para escalar privilégio e manter persistência.',
         impact: 'Risco de incidente de segurança com impacto financeiro, jurídico e reputacional.',
-        likelihood: 'Média',
-        prereqs: 'Encadeamento com outras fragilidades do ambiente.'
     };
+}
+
+function renderScanMeta(report) {
+    if (!scanMeta) return;
+    const meta = report?.meta || {};
+    const version = report?.scanner_version || meta.scanner_version || '—';
+    const ms = meta.duration_ms;
+    if (ms == null && !version) {
+        scanMeta.style.display = 'none';
+        return;
+    }
+    const duration = ms != null ? `${(ms / 1000).toFixed(1)}s` : '—';
+    const cancelled = meta.cancelled ? ' • cancelado parcialmente' : '';
+    scanMeta.textContent = `Scanner v${version} • duração ${duration}${cancelled}`;
+    scanMeta.style.display = 'block';
 }
 
 function renderTrend(comparison) {
@@ -637,6 +654,14 @@ document.getElementById('btnExportCsv')?.addEventListener('click', () => {
     } catch (e) { toast('Erro ao exportar CSV'); }
 });
 
+document.getElementById('btnExportSarif')?.addEventListener('click', () => {
+    if (!lastReport?.findings?.length) return;
+    try {
+        window.open('/api/export?format=sarif', '_blank');
+        toast('SARIF exportado');
+    } catch (e) { toast('Erro ao exportar SARIF'); }
+});
+
 document.getElementById('btnExportHtml')?.addEventListener('click', () => {
     if (!lastReport?.findings?.length) return;
     try {
@@ -663,7 +688,12 @@ form.addEventListener('submit', async (e) => {
     const e2eProfile = document.getElementById('e2e_profile')?.value?.trim() || '';
     const cloudflareTimeout = document.getElementById('cloudflare_timeout')?.value || '60000';
 
-    const payload = { url, checks, e2e_human: e2eHuman };
+    if (scanAuthorized && !scanAuthorized.checked) {
+        toast('Marque a confirmação de autorização para escanear');
+        return;
+    }
+
+    const payload = { url, checks, e2e_human: e2eHuman, authorized: true };
     if (e2eAdvanced) {
         payload.e2e_advanced = true;
         if (e2eProfile) payload.e2e_profile = e2eProfile;
@@ -673,6 +703,8 @@ form.addEventListener('submit', async (e) => {
     saveState();
     btn.disabled = true;
     btn.innerHTML = '<span class="spinner"></span> Escaneando...';
+    if (btnCancelScan) btnCancelScan.style.display = 'inline-block';
+    currentJobId = null;
     resultsDiv.style.display = 'none';
     const e2eStatusDiv = document.getElementById('e2eStatus');
     if (e2eStatusDiv) e2eStatusDiv.style.display = 'none';
@@ -706,6 +738,7 @@ form.addEventListener('submit', async (e) => {
         if (!data.job_id) {
             throw new Error('Servidor não retornou job_id para acompanhamento');
         }
+        currentJobId = data.job_id;
 
         let pollDone = false;
         while (!pollDone) {
@@ -723,6 +756,9 @@ form.addEventListener('submit', async (e) => {
             if (pData.status === 'error') {
                 throw new Error(pData.error || 'Scan falhou');
             }
+            if (pData.status === 'cancelled') {
+                throw new Error('Scan cancelado');
+            }
             if (pData.status !== 'done') {
                 continue;
             }
@@ -737,6 +773,7 @@ form.addEventListener('submit', async (e) => {
             renderFindings(getFilteredSortedFindings());
             renderAIInsights(result.ai_insights);
             renderTrend(result.comparison);
+            renderScanMeta(result);
             if (result.e2e_advanced_started && document.getElementById('e2eStatus')) startE2EStatusPolling();
             setScanProgress(100, 'Scan concluído');
             pollDone = true;
@@ -753,6 +790,18 @@ form.addEventListener('submit', async (e) => {
     setTimeout(clearScanProgress, 900);
     btn.disabled = false;
     btn.textContent = 'Escanear';
+    if (btnCancelScan) btnCancelScan.style.display = 'none';
+    currentJobId = null;
+});
+
+btnCancelScan?.addEventListener('click', async () => {
+    if (!currentJobId) return;
+    try {
+        await fetch(`/api/scan/${encodeURIComponent(currentJobId)}`, { method: 'DELETE' });
+        toast('Cancelamento solicitado');
+    } catch (e) {
+        toast('Falha ao cancelar scan');
+    }
 });
 
 btnExecutiveMode?.addEventListener('click', () => {

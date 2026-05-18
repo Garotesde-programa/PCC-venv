@@ -15,8 +15,11 @@ import threading
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from flask import Flask, render_template, request, jsonify, redirect
-from scanner_site import scan, run_e2e_human
+from scanner_site import scan, run_e2e_human, validate_scan_target, SCANNER_VERSION
+from scan_storage import init_db, save_scan, list_history, get_last_report, prune_old
 from werkzeug.middleware.proxy_fix import ProxyFix
+
+init_db()
 
 try:
     from e2e_playwright import run_e2e as run_e2e_advanced
@@ -52,6 +55,7 @@ PROXY_FIX_X_FOR = int(os.getenv('SCANNER_PROXY_FIX_X_FOR', '1'))
 PROXY_FIX_X_PROTO = int(os.getenv('SCANNER_PROXY_FIX_X_PROTO', '1'))
 PROXY_FIX_X_HOST = int(os.getenv('SCANNER_PROXY_FIX_X_HOST', '1'))
 WEB_TOKEN = os.getenv('SCANNER_WEB_TOKEN', '').strip()
+REQUIRE_SCAN_AUTHORIZATION = os.getenv('SCANNER_REQUIRE_AUTHORIZATION', '1').lower() in ('1', 'true', 'yes')
 
 _RATE_LIMIT_BUCKETS = {}
 
@@ -201,7 +205,26 @@ def _run_e2e_advanced_thread(url: str, profile: str | None, cloudflare_timeout_m
 
 @app.route('/')
 def index():
-    return render_template('index.html', e2e_advanced_available=E2E_ADVANCED_AVAILABLE)
+    return render_template(
+        'index.html',
+        e2e_advanced_available=E2E_ADVANCED_AVAILABLE,
+        scanner_version=SCANNER_VERSION,
+    )
+
+
+@app.route('/api/health')
+def api_health():
+    return jsonify({
+        'status': 'ok',
+        'scanner_version': SCANNER_VERSION,
+        'e2e_advanced': E2E_ADVANCED_AVAILABLE,
+        'require_authorization': REQUIRE_SCAN_AUTHORIZATION,
+    })
+
+
+@app.route('/api/version')
+def api_version():
+    return jsonify({'version': SCANNER_VERSION})
 
 
 @app.route('/e2e-status')
@@ -224,7 +247,7 @@ def api_checks():
 @app.route('/api/history')
 def api_history():
     """Últimos scans (url, timestamp, total)."""
-    history = _scan_history[:20]
+    history = list_history(50) or _scan_history[:20]
     enriched = []
     for idx, row in enumerate(history):
         prev = next((r for r in history[idx + 1:] if r.get('url') == row.get('url')), None)
@@ -235,7 +258,14 @@ def api_history():
     return jsonify({'history': enriched})
 
 
-def _store_scan(url: str, total: int, findings: list):
+def _store_scan(
+    url: str,
+    total: int,
+    findings: list,
+    *,
+    checks: list[str] | None = None,
+    meta: dict | None = None,
+):
     global _last_scan_report, _scan_history
     from time import time
     by_type = {}
@@ -248,16 +278,39 @@ def _store_scan(url: str, total: int, findings: list):
             s = 'medium'
         sev[s] += 1
 
+    ts = time()
     scan_row = {
         'url': url,
         'total': total,
-        'ts': time(),
+        'ts': ts,
         'by_type': by_type,
         'severity_breakdown': sev,
     }
-    _last_scan_report = {'url': url, 'findings': findings, 'total': total, 'ts': time(), 'by_type': by_type, 'severity_breakdown': sev}
+    _last_scan_report = {
+        'url': url,
+        'findings': findings,
+        'total': total,
+        'ts': ts,
+        'by_type': by_type,
+        'severity_breakdown': sev,
+        'meta': meta or {},
+        'scanner_version': SCANNER_VERSION,
+    }
     _scan_history.insert(0, scan_row)
     _scan_history[:] = _scan_history[:_MAX_HISTORY]
+    try:
+        save_scan(
+            url,
+            total,
+            findings,
+            checks=checks,
+            by_type=by_type,
+            severity_breakdown=sev,
+            meta=meta,
+        )
+        prune_old(200)
+    except Exception:
+        pass
 
 
 def _build_comparison(url: str, findings: list[dict]) -> dict:
@@ -350,6 +403,12 @@ def _update_job_progress(job_id: str, stage: str, done: int, total: int) -> None
     _update_job(job_id, progress={'done': done, 'total': total, 'percent': pct, 'stage': stage})
 
 
+def _job_cancelled(job_id: str) -> bool:
+    with _scan_jobs_lock:
+        job = _scan_jobs.get(job_id)
+        return bool(job and job.get('status') == 'cancelled')
+
+
 def _run_scan_job(
     job_id: str,
     url: str,
@@ -370,7 +429,18 @@ def _run_scan_job(
         _update_job_progress(job_id, stage, completed['n'], total_steps)
 
     try:
-        findings = scan(url, valid, progress_cb=_progress_cb)
+        report = scan(
+            url,
+            valid,
+            progress_cb=_progress_cb,
+            cancel_cb=lambda: _job_cancelled(job_id),
+        )
+        if _job_cancelled(job_id):
+            _update_job(job_id, status='cancelled', error='Scan cancelado pelo usuário')
+            return
+
+        items = report.get('findings') or []
+        meta = report.get('meta') or {}
 
         if e2e_human and not e2e_advanced:
             threading.Thread(target=run_e2e_human, args=(url,), daemon=True).start()
@@ -382,31 +452,16 @@ def _run_scan_job(
                 daemon=True,
             ).start()
 
-        items = []
-        for item in findings:
-            t, d = item[0], item[1]
-            sev = item[2] if len(item) > 2 else 'medium'
-            rem = item[3] if len(item) > 3 else ''
-            items.append({
-                'type': t,
-                'desc': d,
-                'severity': sev,
-                'remediation': rem,
-                'evidence': {
-                    'request_example': f"GET {url}",
-                    'response_signal': d[:180],
-                    'confidence_hint': f"Achado baseado em assinatura heurística ({sev})",
-                },
-            })
-
         ai_insights = _build_ai_insights(url, items)
         comparison = _build_comparison(url, items)
-        _store_scan(url, len(findings), items)
+        _store_scan(url, len(items), items, checks=valid, meta=meta)
 
         result = {
             'url': url,
             'findings': items,
-            'total': len(findings),
+            'total': len(items),
+            'meta': meta,
+            'scanner_version': SCANNER_VERSION,
             'ai_insights': ai_insights,
             'comparison': comparison,
             'e2e_human_started': bool(e2e_human),
@@ -553,11 +608,48 @@ def _build_ai_insights(url: str, findings: list[dict]) -> dict:
     }
 
 
+def _export_sarif(report: dict) -> dict:
+    findings = report.get('findings') or []
+    rules = {}
+    results = []
+    for f in findings:
+        rule_id = (f.get('check') or 'generic').lower()
+        if rule_id not in rules:
+            rules[rule_id] = {
+                'id': rule_id,
+                'name': f.get('type') or rule_id,
+                'shortDescription': {'text': f.get('type') or rule_id},
+                'properties': {'cwe': f.get('cwe')},
+            }
+        results.append({
+            'ruleId': rule_id,
+            'level': 'error' if f.get('severity') in ('critical', 'high') else 'warning',
+            'message': {'text': f.get('desc') or ''},
+            'properties': {
+                'severity': f.get('severity'),
+                'remediation': f.get('remediation'),
+                'confidence': f.get('confidence'),
+            },
+        })
+    return {
+        'version': '2.1.0',
+        '$schema': 'https://json.schemastore.org/sarif-2.1.0.json',
+        'runs': [{
+            'tool': {'driver': {'name': 'TCC Scanner', 'version': SCANNER_VERSION, 'rules': list(rules.values())}},
+            'results': results,
+        }],
+    }
+
+
 @app.route('/api/export')
 def api_export():
-    """Exporta último relatório: ?format=json|html|csv"""
+    """Exporta último relatório: ?format=json|html|csv|sarif"""
     global _last_scan_report
     fmt = request.args.get('format', 'json').lower()
+    if not _last_scan_report:
+        stored = get_last_report()
+        if stored:
+            _last_scan_report = stored
     if not _last_scan_report:
         from flask import abort
         abort(404, 'Nenhum relatório para exportar')
@@ -568,12 +660,14 @@ def api_export():
         import io
         out = io.StringIO()
         w = csv.writer(out)
-        w.writerow(['Tipo', 'Descrição', 'Severidade', 'Remediação'])
+        w.writerow(['Tipo', 'Descrição', 'Severidade', 'CWE', 'Confiança', 'Remediação'])
         for f in findings:
             w.writerow([
                 f.get('type', ''),
                 f.get('desc', ''),
                 f.get('severity', ''),
+                f.get('cwe', ''),
+                f.get('confidence', ''),
                 (f.get('remediation') or '').replace('\n', ' '),
             ])
         from flask import Response
@@ -612,6 +706,8 @@ ul{{margin:0;padding-left:20px}}
         return Response(html, mimetype='text/html', headers={
             'Content-Disposition': f'inline; filename=scan-{urlparse(url).netloc or "report"}.html'
         })
+    if fmt == 'sarif':
+        return jsonify(_export_sarif(_last_scan_report))
     return jsonify(_last_scan_report)
 
 
@@ -629,6 +725,11 @@ def run_scan():
     data, parse_error = _parse_request_payload()
     if parse_error:
         return jsonify({'error': parse_error}), 415
+    if REQUIRE_SCAN_AUTHORIZATION and not data.get('authorized'):
+        return jsonify({
+            'error': 'Confirme que possui autorização para testar este alvo (authorized=true)',
+        }), 400
+
     url = (data.get('url') or '').strip()
     checks = data.get('checks', ['misconfig', 'sql', 'xss'])
     e2e_human = bool(data.get('e2e_human'))
@@ -636,18 +737,16 @@ def run_scan():
     e2e_profile = (data.get('e2e_profile') or '').strip() or None
     cloudflare_timeout = data.get('cloudflare_timeout')
     cloudflare_timeout_ms = int(cloudflare_timeout) if cloudflare_timeout not in (None, '') else 60_000
-    
+
     if not url:
         return jsonify({'error': 'URL é obrigatória'}), 400
-    
-    if not url.startswith(('http://', 'https://')):
-        url = 'https://' + url
-    
+
+    url, target_error = validate_scan_target(url)
+    if target_error:
+        return jsonify({'error': target_error}), 400
+
     if isinstance(checks, str):
         checks = [c.strip() for c in checks.split(',') if c.strip()]
-
-    if len(url) > 2048:
-        return jsonify({'error': 'URL muito longa'}), 400
 
     if not _is_allowed_domain(url):
         return jsonify({'error': 'Domínio não autorizado para varredura'}), 400
@@ -683,6 +782,21 @@ def api_scan_status(job_id: str):
         if job.get('status') == 'done' and job.get('result'):
             data['result'] = job['result']
         return jsonify(data)
+
+
+@app.route('/api/scan/<job_id>', methods=['DELETE'])
+def api_scan_cancel(job_id: str):
+    if not _check_web_token():
+        return jsonify({'error': 'Token da interface inválido ou ausente'}), 401
+    with _scan_jobs_lock:
+        job = _scan_jobs.get(job_id)
+        if not job:
+            return jsonify({'error': 'Job não encontrado'}), 404
+        if job.get('status') in ('done', 'error', 'cancelled'):
+            return jsonify({'error': 'Job já finalizado', 'status': job.get('status')}), 409
+        job['status'] = 'cancelled'
+        job['updated_at'] = time()
+    return jsonify({'id': job_id, 'status': 'cancelled'})
 
 
 if __name__ == '__main__':

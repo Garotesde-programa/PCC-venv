@@ -12,6 +12,7 @@
         <header>
             <h1>Scanner de Vulnerabilidades</h1>
             <p class="subtitle">Misconfig • SQLi • XSS • Open Redirect • LFI • Cookies • HTTPS • Info Disclosure</p>
+            <p class="version-badge">v{{ scanner_version or '2.0' }} • uso autorizado apenas</p>
         </header>
 
         <div class="card">
@@ -105,8 +106,16 @@
                     <pre id="e2eToken" class="e2e-token" style="display:none"></pre>
                 </div>
                 {% endif %}
+                <div class="legal-consent">
+                    <label class="consent-label">
+                        <input type="checkbox" id="scanAuthorized" required>
+                        Confirmo que tenho autorização explícita para testar este alvo (pentest/QA próprio).
+                    </label>
+                    <p class="consent-hint">Varreduras não autorizadas podem ser ilegais. O scanner bloqueia redes privadas por padrão.</p>
+                </div>
                 <div id="formError" class="form-error" style="display:none"></div>
                 <button type="submit" class="btn" id="btnScan">Escanear</button>
+                <button type="button" class="btn btn-secondary" id="btnCancelScan" style="display:none">Cancelar scan</button>
                 <div id="scanProgressWrap" class="scan-progress-wrap" style="display:none">
                     <div class="scan-progress-bar"><div id="scanProgressFill" class="scan-progress-fill"></div></div>
                     <div id="scanProgressText" class="scan-progress-text">Iniciando...</div>
@@ -119,6 +128,7 @@
                 <span class="results-url" id="resultsUrl"></span>
                 <span id="resultsTotal"></span>
             </div>
+            <div id="scanMeta" class="scan-meta" style="display:none"></div>
             <div class="results-header-actions">
                 <button type="button" class="btn-export" id="btnExecutiveMode">Modo diretoria</button>
                 <button type="button" class="btn-export" id="btnHistory">Histórico</button>
@@ -178,6 +188,7 @@
                 <button type="button" class="btn-export" id="btnExportJson">JSON</button>
                 <button type="button" class="btn-export" id="btnExportCsv">CSV</button>
                 <button type="button" class="btn-export" id="btnExportHtml">HTML</button>
+                <button type="button" class="btn-export" id="btnExportSarif">SARIF</button>
                 <button type="button" class="btn-export" id="btnCopy">Copiar</button>
             </div>
         </div>
